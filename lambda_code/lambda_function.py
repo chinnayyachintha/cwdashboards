@@ -50,18 +50,13 @@ def iso_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 def paginate_list_metrics(**kwargs):
-    """
-    Safe paginator for CloudWatch ListMetrics.
-    ListMetrics does NOT support PaginationConfig/PageSize.
-    """
+    """Safe paginator for CloudWatch ListMetrics (no PageSize)."""
     try:
         paginator = CW.get_paginator("list_metrics")
-        # No PaginationConfig here
         for page in paginator.paginate(**kwargs):
             yield page
     except PaginationError as e:
-        # Fallback to manual NextToken loop if paginator misbehaves
-        print(f"[WARN] Paginator error, falling back to manual loop: {e}")
+        print(f"[WARN] Paginator error, fallback to manual NextToken: {e}")
         token = None
         while True:
             params = dict(kwargs)
@@ -94,9 +89,8 @@ def list_metrics_in_namespace(ns: str) -> list[dict]:
 
 def build_widget(metric: dict) -> dict:
     ns, name = metric["Namespace"], metric["MetricName"]
-    dims = metric.get("Dimensions", [])
     dim_pairs = []
-    for d in dims:
+    for d in metric.get("Dimensions", []):
         dim_pairs += [d["Name"], d["Value"]]
     return {
         "title": name,
@@ -125,34 +119,133 @@ def render_widget_image(widget: dict, max_retries: int = 3):
     print(f"[WARN] Failed to render '{widget.get('title')}' after retries: {last_err}")
     return None
 
-def build_excel(namespace: str, image_map: list[tuple[str, bytes]]) -> bytes:
+# ---------- Excel builder: KPI tiles + image grid + catalog ----------
+def format_dims(metric: dict) -> str:
+    dims = metric.get("Dimensions", [])
+    if not dims:
+        return "-"
+    return ", ".join(f"{d['Name']}={d['Value']}" for d in dims)
+
+def build_excel(namespace: str, items: list[dict], scanned_count: int) -> bytes:
     """
-    Excel sheet with 2-column grid; each tile ~20 rows; labels under images.
+    Build a polished dashboard workbook.
+    items: list of {"title": str, "img": bytes, "metric": dict}
+    scanned_count: how many metrics were scanned in the namespace (pre-render)
     """
     buf = io.BytesIO()
     wb = xlsxwriter.Workbook(buf, {"in_memory": True})
+
+    # ---------- Formats ----------
+    title_fmt   = wb.add_format({"bold": True, "font_size": 18})
+    sub_fmt     = wb.add_format({"font_size": 10, "italic": True, "font_color": "#555555"})
+    tile_hdr    = wb.add_format({"bold": True, "font_color": "#3f4751", "align": "center", "valign": "vcenter"})
+    tile_val    = wb.add_format({"bold": True, "font_size": 16, "align": "center", "valign": "vcenter"})
+    tile_box    = wb.add_format({"border": 1, "bg_color": "#e8f1f8"})
+    section_hdr = wb.add_format({"bold": True, "font_color": "#2b4c7e", "bg_color": "#dfe8f7", "border": 1})
+    small       = wb.add_format({"font_size": 9})
+    link_fmt    = wb.add_format({"font_color": "blue", "underline": 1})
+
+    # ---------- Dashboard sheet ----------
     ws = wb.add_worksheet("Dashboard")
+    ws.set_column(0, 7, 32)         # generous width for tiles/labels
+    ws.set_row(0, 28); ws.set_row(1, 18)
 
-    title_fmt = wb.add_format({"bold": True, "font_size": 14})
-    meta_fmt  = wb.add_format({"font_size": 10, "italic": True})
-    ws.write("A1", f"CloudWatch Metrics: {namespace}", title_fmt)
-    ws.write("A2", f"Region: {REGION} | Lookback: {LOOKBACK_ISO} | Period: {PERIOD_SECONDS}s | Generated: {iso_now()}", meta_fmt)
-    ws.set_column(0, 3, 40)
+    ws.write("A1", f"{namespace} — CloudWatch KPI Dashboard", title_fmt)
+    ws.write("A2", f"Region: {REGION} | Lookback: {LOOKBACK_ISO} | Period: {PERIOD_SECONDS}s | Generated: {iso_now()}", sub_fmt)
 
-    row_base   = 4
-    col_count  = 2
-    row_stride = 20
-    col_stride = 2  # A/C columns
+    # KPI tiles (merge ranges)
+    #   A4:C6 | D4:F6 | A8:C10 | D8:F10
+    ws.merge_range("A4:C4", "Charts rendered", tile_hdr)
+    ws.merge_range("A5:C6", f"{sum(1 for it in items if it.get('img'))}", wb.add_format({**tile_box.properties, **tile_val.properties}))
 
-    for idx, (title, img_data) in enumerate(image_map):
-        if not img_data:
+    ws.merge_range("D4:F4", "Metrics scanned", tile_hdr)
+    ws.merge_range("D5:F6", f"{scanned_count}", wb.add_format({**tile_box.properties, **tile_val.properties}))
+
+    ws.merge_range("A8:C8", "Lookback", tile_hdr)
+    ws.merge_range("A9:C10", LOOKBACK_ISO, wb.add_format({**tile_box.properties, **tile_val.properties}))
+
+    ws.merge_range("D8:F8", "Period (seconds)", tile_hdr)
+    ws.merge_range("D9:F10", f"{PERIOD_SECONDS}", wb.add_format({**tile_box.properties, **tile_val.properties}))
+
+    # Section header for charts
+    ws.merge_range("A12:F12", "Charts", section_hdr)
+
+    # Image grid (2 columns, generous spacing)
+    start_row   = 13
+    col_count   = 2
+    row_stride  = 24     # space between tiles
+    col_stride  = 3      # A/D columns effectively (0 and 3)
+    label_offset= 20     # row below image
+    col0        = 0
+
+    for idx, it in enumerate(items):
+        img = it.get("img")
+        if not img:
             continue
-        r = row_base + (idx // col_count) * row_stride
-        c = (idx % col_count) * col_stride
-        ws.insert_image(r, c, f"{safe(title)}.png",
-                        {"image_data": io.BytesIO(img_data),
+        r = start_row + (idx // col_count) * row_stride
+        c = col0 + (idx % col_count) * col_stride
+        ws.insert_image(r, c, f"{safe(it['title'])}.png",
+                        {"image_data": io.BytesIO(img),
                          "x_scale": IMG_SCALE, "y_scale": IMG_SCALE})
-        ws.write(r + 17, c, title)
+        # label under the chart
+        ws.write(r + label_offset, c, it["title"], small)
+
+    # Quick link to Catalog
+    ws.write_url("A3", "internal:'Catalog'!A1", link_fmt, "Open Catalog →")
+
+    # ---------- Catalog sheet ----------
+    cat = wb.add_worksheet("Catalog")
+    cat.set_column(0, 0, 36)   # MetricName
+    cat.set_column(1, 1, 50)   # Dimensions
+    cat.set_column(2, 4, 18)   # Stat/Period/Rendered
+
+    cat.write_row(0, 0, ["Metric name", "Dimensions", "Stat", "Period (s)", "Rendered"])
+
+    data_rows = []
+    for it in items:
+        m = it["metric"]
+        data_rows.append([
+            m["MetricName"],
+            format_dims(m),
+            "Average",
+            PERIOD_SECONDS,
+            "Yes" if it.get("img") else "No"
+        ])
+
+    # add_table gives filtering/sorting out-of-the-box
+    cat.add_table(0, 0, len(data_rows), 4, {
+        "data": data_rows,
+        "style": "Table Style Medium 2",
+        "columns": [
+            {"header": "Metric name"},
+            {"header": "Dimensions"},
+            {"header": "Stat"},
+            {"header": "Period (s)"},
+            {"header": "Rendered"},
+        ],
+        "autofilter": True
+    })
+
+    # ---------- Readme sheet ----------
+    readme = wb.add_worksheet("Readme")
+    readme.set_column(0, 0, 110)
+    info = [
+        "About",
+        f"- Namespace: {namespace}",
+        f"- Region: {REGION}",
+        f"- Generated: {iso_now()}",
+        "",
+        "How to use",
+        "1) Dashboard sheet: KPI tiles and chart images.",
+        "2) Catalog sheet: sortable list of all metrics scanned for this namespace.",
+        "3) Images are rendered by CloudWatch GetMetricWidgetImage with 'Average' stats.",
+        "",
+        "Tips",
+        "- To reduce file size, cap MAX_METRICS_PER_NS or decrease IMG_SCALE.",
+        "- To focus a set of namespaces, set env var NAMESPACES to a comma-separated list.",
+    ]
+    for i, line in enumerate(info):
+        readme.write(i, 0, line)
 
     wb.close()
     buf.seek(0)
@@ -176,7 +269,6 @@ def send_email(ns_to_excel: dict, summary_lines: list[str]):
         total_b64_bytes = 0
         limit_bytes = int(MAX_EMAIL_MB * 1024 * 1024)
         for ns, info in ns_to_excel.items():
-            # base64 expansion estimate (~4/3) + small MIME overhead
             b64_size = ((len(info["bytes"]) + 2) // 3) * 4 + 2048
             if total_b64_bytes + b64_size > limit_bytes:
                 print(f"[INFO] Skipping attachment for {ns} (would exceed ~{MAX_EMAIL_MB} MB)")
@@ -215,25 +307,29 @@ def lambda_handler(event, context):
 
         widgets = [build_widget(m) for m in metrics]
 
-        image_map = []
+        # render images in parallel
+        rendered_items = []
         with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
-            fut_to_w = {ex.submit(render_widget_image, w): w for w in widgets}
-            for fut in as_completed(fut_to_w):
-                w = fut_to_w[fut]
+            fut_to_idx = {ex.submit(render_widget_image, w): i for i, w in enumerate(widgets)}
+            for fut in as_completed(fut_to_idx):
+                i = fut_to_idx[fut]
+                w = widgets[i]
+                m = metrics[i]
                 img = None
                 try:
                     img = fut.result()
                 except Exception as e:
                     print(f"[WARN] Exception rendering '{w.get('title')}': {e}")
-                if img:
-                    image_map.append((w["title"], img))
+                rendered_items.append({"title": w["title"], "img": img, "metric": m})
 
-        if not image_map:
+        rendered_items.sort(key=lambda it: it["title"])  # stable layout
+        charts_rendered = sum(1 for it in rendered_items if it["img"])
+        if charts_rendered == 0:
             print(f"[INFO] {ns}: no images rendered, skipping Excel")
             continue
 
-        total_rendered += len(image_map)
-        excel_bytes = build_excel(ns, image_map)
+        total_rendered += charts_rendered
+        excel_bytes = build_excel(ns, rendered_items, scanned_count=len(metrics))
 
         key = f"{S3_PREFIX}/{ts_folder}/{safe(ns)}.xlsx"
         s3_path = s3_put(key, excel_bytes,
@@ -243,7 +339,7 @@ def lambda_handler(event, context):
             "bytes": excel_bytes,
             "s3_path": s3_path,
             "size_mb": len(excel_bytes) / (1024 * 1024),
-            "count": len(image_map),
+            "count": charts_rendered,
         }
 
     if not ns_to_excel:
