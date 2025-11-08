@@ -56,6 +56,7 @@ def paginate_list_metrics(**kwargs):
         for page in paginator.paginate(**kwargs):
             yield page
     except PaginationError as e:
+        # Fallback manual loop
         print(f"[WARN] Paginator error, fallback to manual NextToken: {e}")
         token = None
         while True:
@@ -135,47 +136,56 @@ def build_excel(namespace: str, items: list[dict], scanned_count: int) -> bytes:
     buf = io.BytesIO()
     wb = xlsxwriter.Workbook(buf, {"in_memory": True})
 
-    # ---------- Formats ----------
+    # ---------- Format OPTION DICTS ----------
+    tile_box_opts = {"border": 1, "bg_color": "#e8f1f8"}
+    tile_hdr_opts = {"bold": True, "font_color": "#3f4751", "align": "center", "valign": "vcenter"}
+    tile_val_opts = {"bold": True, "font_size": 16, "align": "center", "valign": "vcenter"}
+
+    # Build Formats
     title_fmt   = wb.add_format({"bold": True, "font_size": 18})
     sub_fmt     = wb.add_format({"font_size": 10, "italic": True, "font_color": "#555555"})
-    tile_hdr    = wb.add_format({"bold": True, "font_color": "#3f4751", "align": "center", "valign": "vcenter"})
-    tile_val    = wb.add_format({"bold": True, "font_size": 16, "align": "center", "valign": "vcenter"})
-    tile_box    = wb.add_format({"border": 1, "bg_color": "#e8f1f8"})
     section_hdr = wb.add_format({"bold": True, "font_color": "#2b4c7e", "bg_color": "#dfe8f7", "border": 1})
     small       = wb.add_format({"font_size": 9})
     link_fmt    = wb.add_format({"font_color": "blue", "underline": 1})
 
+    def make_fmt(*opts_dicts):
+        merged = {}
+        for d in opts_dicts:
+            merged.update(d)
+        return wb.add_format(merged)
+
+    tile_hdr = make_fmt(tile_hdr_opts)
+    tile_val = make_fmt(tile_box_opts, tile_val_opts)
+
     # ---------- Dashboard sheet ----------
     ws = wb.add_worksheet("Dashboard")
-    ws.set_column(0, 7, 32)         # generous width for tiles/labels
+    ws.set_column(0, 7, 32)
     ws.set_row(0, 28); ws.set_row(1, 18)
 
     ws.write("A1", f"{namespace} — CloudWatch KPI Dashboard", title_fmt)
     ws.write("A2", f"Region: {REGION} | Lookback: {LOOKBACK_ISO} | Period: {PERIOD_SECONDS}s | Generated: {iso_now()}", sub_fmt)
 
-    # KPI tiles (merge ranges)
-    #   A4:C6 | D4:F6 | A8:C10 | D8:F10
+    # KPI tiles
     ws.merge_range("A4:C4", "Charts rendered", tile_hdr)
-    ws.merge_range("A5:C6", f"{sum(1 for it in items if it.get('img'))}", wb.add_format({**tile_box.properties, **tile_val.properties}))
+    ws.merge_range("A5:C6", str(sum(1 for it in items if it.get('img'))), tile_val)
 
     ws.merge_range("D4:F4", "Metrics scanned", tile_hdr)
-    ws.merge_range("D5:F6", f"{scanned_count}", wb.add_format({**tile_box.properties, **tile_val.properties}))
+    ws.merge_range("D5:F6", str(scanned_count), tile_val)
 
     ws.merge_range("A8:C8", "Lookback", tile_hdr)
-    ws.merge_range("A9:C10", LOOKBACK_ISO, wb.add_format({**tile_box.properties, **tile_val.properties}))
+    ws.merge_range("A9:C10", LOOKBACK_ISO, tile_val)
 
     ws.merge_range("D8:F8", "Period (seconds)", tile_hdr)
-    ws.merge_range("D9:F10", f"{PERIOD_SECONDS}", wb.add_format({**tile_box.properties, **tile_val.properties}))
+    ws.merge_range("D9:F10", str(PERIOD_SECONDS), tile_val)
 
-    # Section header for charts
     ws.merge_range("A12:F12", "Charts", section_hdr)
 
-    # Image grid (2 columns, generous spacing)
+    # Image grid
     start_row   = 13
     col_count   = 2
-    row_stride  = 24     # space between tiles
-    col_stride  = 3      # A/D columns effectively (0 and 3)
-    label_offset= 20     # row below image
+    row_stride  = 24
+    col_stride  = 3
+    label_offset= 20
     col0        = 0
 
     for idx, it in enumerate(items):
@@ -187,17 +197,15 @@ def build_excel(namespace: str, items: list[dict], scanned_count: int) -> bytes:
         ws.insert_image(r, c, f"{safe(it['title'])}.png",
                         {"image_data": io.BytesIO(img),
                          "x_scale": IMG_SCALE, "y_scale": IMG_SCALE})
-        # label under the chart
         ws.write(r + label_offset, c, it["title"], small)
 
-    # Quick link to Catalog
     ws.write_url("A3", "internal:'Catalog'!A1", link_fmt, "Open Catalog →")
 
     # ---------- Catalog sheet ----------
     cat = wb.add_worksheet("Catalog")
-    cat.set_column(0, 0, 36)   # MetricName
-    cat.set_column(1, 1, 50)   # Dimensions
-    cat.set_column(2, 4, 18)   # Stat/Period/Rendered
+    cat.set_column(0, 0, 36)
+    cat.set_column(1, 1, 50)
+    cat.set_column(2, 4, 18)
 
     cat.write_row(0, 0, ["Metric name", "Dimensions", "Stat", "Period (s)", "Rendered"])
 
@@ -212,7 +220,6 @@ def build_excel(namespace: str, items: list[dict], scanned_count: int) -> bytes:
             "Yes" if it.get("img") else "No"
         ])
 
-    # add_table gives filtering/sorting out-of-the-box
     cat.add_table(0, 0, len(data_rows), 4, {
         "data": data_rows,
         "style": "Table Style Medium 2",
@@ -236,13 +243,13 @@ def build_excel(namespace: str, items: list[dict], scanned_count: int) -> bytes:
         f"- Generated: {iso_now()}",
         "",
         "How to use",
-        "1) Dashboard sheet: KPI tiles and chart images.",
-        "2) Catalog sheet: sortable list of all metrics scanned for this namespace.",
-        "3) Images are rendered by CloudWatch GetMetricWidgetImage with 'Average' stats.",
+        "1) Dashboard: KPI tiles and chart images.",
+        "2) Catalog: sortable list of metrics scanned for this namespace.",
+        "3) Charts rendered via CloudWatch GetMetricWidgetImage (Average).",
         "",
         "Tips",
-        "- To reduce file size, cap MAX_METRICS_PER_NS or decrease IMG_SCALE.",
-        "- To focus a set of namespaces, set env var NAMESPACES to a comma-separated list.",
+        "- Reduce file size by lowering MAX_METRICS_PER_NS or IMG_SCALE.",
+        "- Limit namespaces via env var NAMESPACES (comma-separated).",
     ]
     for i, line in enumerate(info):
         readme.write(i, 0, line)
@@ -269,6 +276,7 @@ def send_email(ns_to_excel: dict, summary_lines: list[str]):
         total_b64_bytes = 0
         limit_bytes = int(MAX_EMAIL_MB * 1024 * 1024)
         for ns, info in ns_to_excel.items():
+            # base64 expansion estimate (~4/3) + small MIME overhead
             b64_size = ((len(info["bytes"]) + 2) // 3) * 4 + 2048
             if total_b64_bytes + b64_size > limit_bytes:
                 print(f"[INFO] Skipping attachment for {ns} (would exceed ~{MAX_EMAIL_MB} MB)")
