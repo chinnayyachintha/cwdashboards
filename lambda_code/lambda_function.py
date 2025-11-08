@@ -56,7 +56,6 @@ def paginate_list_metrics(**kwargs):
         for page in paginator.paginate(**kwargs):
             yield page
     except PaginationError as e:
-        # Fallback manual loop
         print(f"[WARN] Paginator error, fallback to manual NextToken: {e}")
         token = None
         while True:
@@ -104,6 +103,7 @@ def build_widget(metric: dict) -> dict:
         "end": "PT0M",
         "width": WIDGET_WIDTH,
         "height": WIDGET_HEIGHT,
+        "yAxis": {"left": {"min": 0}}  # slight normalization helps readability
     }
 
 def render_widget_image(widget: dict, max_retries: int = 3):
@@ -129,9 +129,8 @@ def format_dims(metric: dict) -> str:
 
 def build_excel(namespace: str, items: list[dict], scanned_count: int) -> bytes:
     """
-    Build a polished dashboard workbook.
+    Build a polished dashboard workbook with gridlines hidden for clean look.
     items: list of {"title": str, "img": bytes, "metric": dict}
-    scanned_count: how many metrics were scanned in the namespace (pre-render)
     """
     buf = io.BytesIO()
     wb = xlsxwriter.Workbook(buf, {"in_memory": True})
@@ -159,54 +158,58 @@ def build_excel(namespace: str, items: list[dict], scanned_count: int) -> bytes:
 
     # ---------- Dashboard sheet ----------
     ws = wb.add_worksheet("Dashboard")
-    ws.set_column(0, 7, 32)
+    ws.hide_gridlines(2)                   # <<< hide gridlines (screen + print)
+    # White-space margins (A and G columns narrow)
+    ws.set_column(0, 0, 2.5)               # left margin
+    ws.set_column(6, 6, 2.5)               # right margin
+    ws.set_column(1, 5, 32)                # main content (B..F)
     ws.set_row(0, 28); ws.set_row(1, 18)
 
-    ws.write("A1", f"{namespace} — CloudWatch KPI Dashboard", title_fmt)
-    ws.write("A2", f"Region: {REGION} | Lookback: {LOOKBACK_ISO} | Period: {PERIOD_SECONDS}s | Generated: {iso_now()}", sub_fmt)
+    ws.write("B1", f"{namespace} — CloudWatch KPI Dashboard", title_fmt)
+    ws.write("B2", f"Region: {REGION} | Lookback: {LOOKBACK_ISO} | Period: {PERIOD_SECONDS}s | Generated: {iso_now()}", sub_fmt)
 
-    # KPI tiles
-    ws.merge_range("A4:C4", "Charts rendered", tile_hdr)
-    ws.merge_range("A5:C6", str(sum(1 for it in items if it.get('img'))), tile_val)
+    # KPI tiles (use B..F so left margin stays empty)
+    ws.merge_range("B4:D4", "Charts rendered", tile_hdr)
+    ws.merge_range("B5:D6", str(sum(1 for it in items if it.get('img'))), tile_val)
 
-    ws.merge_range("D4:F4", "Metrics scanned", tile_hdr)
-    ws.merge_range("D5:F6", str(scanned_count), tile_val)
+    ws.merge_range("E4:G4", "Metrics scanned", tile_hdr)
+    ws.merge_range("E5:G6", str(scanned_count), tile_val)
 
-    ws.merge_range("A8:C8", "Lookback", tile_hdr)
-    ws.merge_range("A9:C10", LOOKBACK_ISO, tile_val)
+    ws.merge_range("B8:D8", "Lookback", tile_hdr)
+    ws.merge_range("B9:D10", LOOKBACK_ISO, tile_val)
 
-    ws.merge_range("D8:F8", "Period (seconds)", tile_hdr)
-    ws.merge_range("D9:F10", str(PERIOD_SECONDS), tile_val)
+    ws.merge_range("E8:G8", "Period (seconds)", tile_hdr)
+    ws.merge_range("E9:G10", str(PERIOD_SECONDS), tile_val)
 
-    ws.merge_range("A12:F12", "Charts", section_hdr)
+    ws.merge_range("B12:G12", "Charts", section_hdr)
 
-    # Image grid
+    # Image grid (start from column B index=1 to keep left margin)
     start_row   = 13
-    col_count   = 2
-    row_stride  = 24
-    col_stride  = 3
-    label_offset= 20
-    col0        = 0
+    col_count   = 3            # tighter, pretty grid (B,D,F)
+    row_stride  = 22
+    col_stride  = 2            # B/D/F -> 1,3,5
+    label_offset= 18
+    base_col    = 1
 
     for idx, it in enumerate(items):
         img = it.get("img")
         if not img:
             continue
         r = start_row + (idx // col_count) * row_stride
-        c = col0 + (idx % col_count) * col_stride
+        c = base_col + (idx % col_count) * col_stride
         ws.insert_image(r, c, f"{safe(it['title'])}.png",
                         {"image_data": io.BytesIO(img),
                          "x_scale": IMG_SCALE, "y_scale": IMG_SCALE})
         ws.write(r + label_offset, c, it["title"], small)
 
-    ws.write_url("A3", "internal:'Catalog'!A1", link_fmt, "Open Catalog →")
+    ws.write_url("B3", "internal:'Catalog'!A1", link_fmt, "Open Catalog →")
 
     # ---------- Catalog sheet ----------
     cat = wb.add_worksheet("Catalog")
+    cat.hide_gridlines(2)                  # <<< hide gridlines
     cat.set_column(0, 0, 36)
     cat.set_column(1, 1, 50)
     cat.set_column(2, 4, 18)
-
     cat.write_row(0, 0, ["Metric name", "Dimensions", "Stat", "Period (s)", "Rendered"])
 
     data_rows = []
@@ -235,6 +238,7 @@ def build_excel(namespace: str, items: list[dict], scanned_count: int) -> bytes:
 
     # ---------- Readme sheet ----------
     readme = wb.add_worksheet("Readme")
+    readme.hide_gridlines(2)               # <<< hide gridlines
     readme.set_column(0, 0, 110)
     info = [
         "About",
@@ -243,7 +247,7 @@ def build_excel(namespace: str, items: list[dict], scanned_count: int) -> bytes:
         f"- Generated: {iso_now()}",
         "",
         "How to use",
-        "1) Dashboard: KPI tiles and chart images.",
+        "1) Dashboard: KPI tiles and chart images (gridlines hidden for clean look).",
         "2) Catalog: sortable list of metrics scanned for this namespace.",
         "3) Charts rendered via CloudWatch GetMetricWidgetImage (Average).",
         "",
@@ -276,7 +280,6 @@ def send_email(ns_to_excel: dict, summary_lines: list[str]):
         total_b64_bytes = 0
         limit_bytes = int(MAX_EMAIL_MB * 1024 * 1024)
         for ns, info in ns_to_excel.items():
-            # base64 expansion estimate (~4/3) + small MIME overhead
             b64_size = ((len(info["bytes"]) + 2) // 3) * 4 + 2048
             if total_b64_bytes + b64_size > limit_bytes:
                 print(f"[INFO] Skipping attachment for {ns} (would exceed ~{MAX_EMAIL_MB} MB)")
@@ -330,7 +333,7 @@ def lambda_handler(event, context):
                     print(f"[WARN] Exception rendering '{w.get('title')}': {e}")
                 rendered_items.append({"title": w["title"], "img": img, "metric": m})
 
-        rendered_items.sort(key=lambda it: it["title"])  # stable layout
+        rendered_items.sort(key=lambda it: it["title"])
         charts_rendered = sum(1 for it in rendered_items if it["img"])
         if charts_rendered == 0:
             print(f"[INFO] {ns}: no images rendered, skipping Excel")
