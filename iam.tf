@@ -4,7 +4,6 @@
 data "aws_iam_policy_document" "lambda_assume_role" {
   statement {
     actions = ["sts:AssumeRole"]
-
     principals {
       type        = "Service"
       identifiers = ["lambda.amazonaws.com"]
@@ -18,10 +17,11 @@ resource "aws_iam_role" "lambda_exec_role" {
 }
 
 # ---------------------------
-# Lambda Permissions Policy (minimum)
+# Lambda Permissions Policy (Full & Clean)
 # ---------------------------
 data "aws_iam_policy_document" "lambda_policy" {
-  # CloudWatch Logs
+
+  # CloudWatch Logs (for Lambda logging)
   statement {
     effect = "Allow"
     actions = [
@@ -32,14 +32,14 @@ data "aws_iam_policy_document" "lambda_policy" {
     resources = ["arn:aws:logs:*:*:*"]
   }
 
-  # STS
+  # STS identity (useful for account info)
   statement {
     effect    = "Allow"
     actions   = ["sts:GetCallerIdentity"]
     resources = ["*"]
   }
 
-  # CloudWatch Metrics
+  # CloudWatch metrics read access
   statement {
     effect = "Allow"
     actions = [
@@ -50,7 +50,7 @@ data "aws_iam_policy_document" "lambda_policy" {
     resources = ["*"]
   }
 
-  # S3 Access
+  # S3 access for storing Excel dashboards
   statement {
     effect = "Allow"
     actions = [
@@ -60,7 +60,7 @@ data "aws_iam_policy_document" "lambda_policy" {
     resources = ["${aws_s3_bucket.securityhub_reports.arn}/*"]
   }
 
-  # SES Email Sending
+  # SES for sending emails
   statement {
     effect = "Allow"
     actions = [
@@ -69,10 +69,25 @@ data "aws_iam_policy_document" "lambda_policy" {
     ]
     resources = ["*"]
   }
+
+  # ---------------------------
+  # ECR: Required for Lambda Image-based Functions
+  # ---------------------------
+  statement {
+    sid    = "AllowPullFromECR"
+    effect = "Allow"
+    actions = [
+      "ecr:GetAuthorizationToken",
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:GetDownloadUrlForLayer",
+      "ecr:BatchGetImage"
+    ]
+    resources = ["*"]
+  }
 }
 
 # ---------------------------
-# Create & Attach Policy
+# Create and Attach Policy
 # ---------------------------
 resource "aws_iam_policy" "lambda_policy" {
   name   = "cwdashboards-policy"
@@ -82,4 +97,13 @@ resource "aws_iam_policy" "lambda_policy" {
 resource "aws_iam_role_policy_attachment" "lambda_attach" {
   role       = aws_iam_role.lambda_exec_role.name
   policy_arn = aws_iam_policy.lambda_policy.arn
+}
+
+# ---------------------------
+# Attach AWS Managed Policy for VPC Access (Optional)
+# ---------------------------
+# Only if your Lambda runs inside a VPC (e.g., EFS or private subnets)
+resource "aws_iam_role_policy_attachment" "vpc_access" {
+  role       = aws_iam_role.lambda_exec_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
