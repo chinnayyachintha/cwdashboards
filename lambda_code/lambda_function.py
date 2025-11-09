@@ -2,10 +2,10 @@
 # Lambda: CloudWatch Metrics → Excel (Images-only) → S3 + Email
 # - Single account (current), multi-region
 # - S3 path: {S3_PREFIX_BASE}/{ACCOUNT_ID}/{REGION}/{NAMESPACE}/{TIMESTAMP}/{NAMESPACE}.xlsx
-# - Email: short body + attach existing ZIP from S3 (ZIP_S3_KEY)
+# - Email: short body + attach ZIP built for this run (plus link)
 # ===============================================================
 
-import os, io, re, time, json, boto3
+import os, io, re, time, json, boto3, zipfile
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.multipart import MIMEMultipart
@@ -42,9 +42,16 @@ CONCURRENCY         = int(os.getenv("CONCURRENCY", "12"))
 IMG_SCALE           = float(os.getenv("IMG_SCALE", "0.35"))
 WIDGET_WIDTH        = int(os.getenv("WIDGET_WIDTH", "1067"))
 WIDGET_HEIGHT       = int(os.getenv("WIDGET_HEIGHT", "300"))
-ZIP_S3_KEY          = os.getenv("ZIP_S3_KEY")  # existing ZIP to attach
+
+# If set, we will also *mention* this in email, but we always attach the ZIP we generate this run
+ZIP_S3_KEY          = os.getenv("ZIP_S3_KEY")
+
 MAX_EMAIL_MB        = float(os.getenv("MAX_EMAIL_MB", "7"))
 RENDER_SLEEP_SEC    = float(os.getenv("RENDER_SLEEP_SEC", "0.0"))
+
+# New: metric label formatting
+METRIC_LABEL_FONT_SIZE = int(os.getenv("METRIC_LABEL_FONT_SIZE", "11"))
+METRIC_LABEL_BOLD      = os.getenv("METRIC_LABEL_BOLD", "true").lower() in ("1", "true", "yes")
 
 # ---------------------------
 # Helpers
@@ -145,9 +152,10 @@ def build_excel_images_only(namespace: str, region: str, items: list[dict], scan
     tile_hdr    = wb.add_format({"bold": True, "align": "center", "valign": "vcenter", "border": 1, "bg_color": "#e8f1f8"})
     tile_val    = wb.add_format({"bold": True, "font_size": 16, "align": "center", "valign": "vcenter", "border": 1, "bg_color": "#e8f1f8"})
     section_hdr = wb.add_format({"bold": True, "font_color": "#2b4c7e", "bg_color": "#dfe8f7", "border": 1})
-    small       = wb.add_format({"font_size": 9})
+    label_fmt   = wb.add_format({"font_size": METRIC_LABEL_FONT_SIZE, "bold": METRIC_LABEL_BOLD})
 
     ws = wb.add_worksheet("Dashboard")
+    ws.hide_gridlines(2)  # remove background/grid lines
     ws.set_column(0, 7, 32)
     ws.set_row(0, 28); ws.set_row(1, 18)
 
@@ -178,7 +186,7 @@ def build_excel_images_only(namespace: str, region: str, items: list[dict], scan
         ws.insert_image(r, c, f"{safe(it['title'])}.png",
                         {"image_data": io.BytesIO(img),
                          "x_scale": IMG_SCALE, "y_scale": IMG_SCALE})
-        ws.write(r + label_offset, c, it["title"], small)
+        ws.write(r + label_offset, c, it["title"], label_fmt)
 
     wb.close()
     buf.seek(0)
@@ -229,7 +237,7 @@ def send_short_email_with_existing_zip(summary_lines: list[str], zip_bytes: byte
                             filename=(zip_filename or "dashboards.zip"))
             msg.attach(part)
         else:
-            print(f"[INFO] Existing ZIP too large for email (~{MAX_EMAIL_MB} MB cap); sending without attachment.")
+            print(f"[INFO] ZIP too large for email (~{MAX_EMAIL_MB} MB cap); sending without attachment.")
 
     SES.send_raw_email(
         Source=SES_SENDER_EMAIL,
@@ -252,7 +260,7 @@ def lambda_handler(event, context):
     for region in REGIONS:
         cw = cw_client(region)
 
-        # Resolve namespaces
+        # Resolve namespaces per region
         target_namespaces = NAMESPACES if NAMESPACES else list_namespaces(cw)
         print(f"[INFO] Region {region}: {len(target_namespaces)} namespaces")
 
@@ -305,6 +313,21 @@ def lambda_handler(event, context):
     if not excel_index:
         return {"status": "no_excel_files_generated", "account": account_id, "regions": REGIONS}
 
+    # ---- Build a single ZIP for this account with all region/namespace Excels
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for region, ns_map in excel_index.items():
+            for ns, info in ns_map.items():
+                # Path inside zip: region/namespace.xlsx
+                z.writestr(f"{region}/{safe(ns)}.xlsx", info["bytes"])
+    zip_buf.seek(0)
+    generated_zip_bytes = zip_buf.read()
+
+    # Put ZIP under the account folder for this run:
+    # {S3_PREFIX_BASE}/{ACCOUNT_ID}/{TIMESTAMP}/dashboards.zip
+    zip_key_generated = f"{S3_PREFIX_BASE}/{account_id}/{ts_folder}/dashboards.zip"
+    s3_zip_uri = s3_put(zip_key_generated, generated_zip_bytes, "application/zip")
+
     # Build summary lines
     lines = [f"Account: {account_id}", f"Run: {ts_folder}", ""]
     for region in sorted(excel_index.keys()):
@@ -313,17 +336,13 @@ def lambda_handler(event, context):
             lines.append(f"  - {ns}: {info['count']} charts → {info['s3_uri']} ({info['size_mb']:.2f} MB)")
         lines.append("")
 
-    # Fetch existing ZIP (optional) and email
-    zip_bytes, zip_name = None, None
+    # Mention the generated ZIP and optional env ZIP
+    lines.insert(2, f"ZIP (this run): {s3_zip_uri}")
     if ZIP_S3_KEY:
-        try:
-            zip_bytes = s3_get_bytes(ZIP_S3_KEY)
-            zip_name = os.path.basename(ZIP_S3_KEY)
-            lines.insert(2, f"ZIP in S3: s3://{S3_BUCKET}/{ZIP_S3_KEY}")
-        except Exception as e:
-            print(f"[WARN] Could not download existing ZIP '{ZIP_S3_KEY}': {e}")
+        lines.insert(3, f"Existing ZIP (env): s3://{S3_BUCKET}/{ZIP_S3_KEY}")
 
-    send_short_email_with_existing_zip(lines, zip_bytes, zip_name)
+    # Attach the ZIP we just generated (subject to size cap)
+    send_short_email_with_existing_zip(lines, generated_zip_bytes, "dashboards.zip")
 
     return {
         "status": "email_sent",
@@ -338,5 +357,6 @@ def lambda_handler(event, context):
                 "counts": {ns: excel_index[r][ns]["count"] for ns in excel_index[r].keys()}
             } for r in excel_index.keys()
         },
-        "zip_used": ZIP_S3_KEY
+        "zip_generated": f"s3://{S3_BUCKET}/{zip_key_generated}",
+        "zip_env_also_listed": bool(ZIP_S3_KEY)
     }
