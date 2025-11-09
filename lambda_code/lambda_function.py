@@ -2,7 +2,7 @@
 # Lambda: CloudWatch Metrics → Excel (Images-only) → S3 + Email
 # - Single account (current), multi-region
 # - S3 path: {S3_PREFIX_BASE}/{ACCOUNT_ID}/{REGION}/{NAMESPACE}/{TIMESTAMP}/{NAMESPACE}.xlsx
-# - Email: short body + attach ZIP built for this run (plus link)
+# - Email: short body, attach ZIP built for this run (no links)
 # ===============================================================
 
 import os, io, re, time, json, boto3, zipfile
@@ -42,14 +42,10 @@ CONCURRENCY         = int(os.getenv("CONCURRENCY", "12"))
 IMG_SCALE           = float(os.getenv("IMG_SCALE", "0.35"))
 WIDGET_WIDTH        = int(os.getenv("WIDGET_WIDTH", "1067"))
 WIDGET_HEIGHT       = int(os.getenv("WIDGET_HEIGHT", "300"))
-
-# If set, we will also *mention* this in email, but we always attach the ZIP we generate this run
-ZIP_S3_KEY          = os.getenv("ZIP_S3_KEY")
-
 MAX_EMAIL_MB        = float(os.getenv("MAX_EMAIL_MB", "7"))
 RENDER_SLEEP_SEC    = float(os.getenv("RENDER_SLEEP_SEC", "0.0"))
 
-# New: metric label formatting
+# Label formatting
 METRIC_LABEL_FONT_SIZE = int(os.getenv("METRIC_LABEL_FONT_SIZE", "11"))
 METRIC_LABEL_BOLD      = os.getenv("METRIC_LABEL_BOLD", "true").lower() in ("1", "true", "yes")
 
@@ -199,10 +195,6 @@ def s3_put(key: str, data: bytes, content_type: str) -> str:
     S3.put_object(Bucket=S3_BUCKET, Key=key, Body=data, ContentType=content_type)
     return f"s3://{S3_BUCKET}/{key}"
 
-def s3_get_bytes(key: str) -> bytes:
-    resp = S3.get_object(Bucket=S3_BUCKET, Key=key)
-    return resp["Body"].read()
-
 def human_period(lookback_iso: str) -> str:
     iso = lookback_iso.upper()
     if iso in ("-PT24H", "-P1D"):
@@ -211,39 +203,47 @@ def human_period(lookback_iso: str) -> str:
         return "the past week"
     return f"lookback {lookback_iso}"
 
-def send_short_email_with_existing_zip(summary_lines: list[str], zip_bytes: bytes | None, zip_filename: str | None):
+def send_email_zip_only(summary_lines: list[str], zip_bytes: bytes, zip_filename: str = "dashboards.zip"):
+    """
+    Sends a short plain-text email and attaches the provided ZIP.
+    Does NOT include any S3 links in the body.
+    """
     msg = MIMEMultipart()
     msg["Subject"] = "CloudWatch Metric Dashboards"
     msg["From"] = SES_SENDER_EMAIL
     msg["To"] = ", ".join(SES_RECIPIENT_EMAILS)
 
+    # Short, clean message – no links
     body_lines = [
         "Hi team,",
         f"This is the CloudWatch metric dashboard for {human_period(LOOKBACK_ISO)}.",
         "",
-        *summary_lines,
+        *summary_lines,   # keep this short; no links
         "",
         "Regards,"
     ]
     msg.attach(MIMEText("\n".join(body_lines), "plain"))
 
+    # Size guard (prevent SES raw size rejection)
     if zip_bytes:
-        # base64 expansion estimate
-        b64_size = ((len(zip_bytes) + 2) // 3) * 4 + 4096
+        raw_size = len(zip_bytes)
+        b64_size = ((raw_size + 2) // 3) * 4 + 4096
         limit = int(MAX_EMAIL_MB * 1024 * 1024)
+        print(f"[INFO] ZIP raw={raw_size} bytes, est_b64={b64_size}, cap={limit} (~{MAX_EMAIL_MB} MB)")
         if b64_size <= limit:
             part = MIMEApplication(zip_bytes)
-            part.add_header("Content-Disposition", "attachment",
-                            filename=(zip_filename or "dashboards.zip"))
+            part.add_header("Content-Disposition", "attachment", filename=zip_filename)
             msg.attach(part)
+            print(f"[INFO] ZIP attached: {zip_filename}")
         else:
-            print(f"[INFO] ZIP too large for email (~{MAX_EMAIL_MB} MB cap); sending without attachment.")
+            print(f"[WARN] ZIP too large to attach (over cap). Email sent without attachment.")
 
-    SES.send_raw_email(
+    resp = SES.send_raw_email(
         Source=SES_SENDER_EMAIL,
         Destinations=SES_RECIPIENT_EMAILS,
         RawMessage={"Data": msg.as_string()},
     )
+    print(f"[INFO] SES MessageId: {resp.get('MessageId')}")
 
 # ---------------------------
 # Lambda handler
@@ -305,7 +305,7 @@ def lambda_handler(event, context):
             excel_index.setdefault(region, {})
             excel_index[region][ns] = {
                 "bytes": excel_bytes,
-                "s3_uri": s3_uri,
+                "s3_uri": s3_uri,  # kept for logs/traceability (not emailed)
                 "count": charts_rendered,
                 "size_mb": len(excel_bytes) / (1024 * 1024),
             }
@@ -323,26 +323,20 @@ def lambda_handler(event, context):
     zip_buf.seek(0)
     generated_zip_bytes = zip_buf.read()
 
-    # Put ZIP under the account folder for this run:
-    # {S3_PREFIX_BASE}/{ACCOUNT_ID}/{TIMESTAMP}/dashboards.zip
+    # Put ZIP under the account folder for this run (durability only; not referenced in email)
     zip_key_generated = f"{S3_PREFIX_BASE}/{account_id}/{ts_folder}/dashboards.zip"
-    s3_zip_uri = s3_put(zip_key_generated, generated_zip_bytes, "application/zip")
+    s3_put(zip_key_generated, generated_zip_bytes, "application/zip")
 
-    # Build summary lines
+    # ---- Build short summary lines (no links)
+    # Keep concise: account, run timestamp, per-region counts
     lines = [f"Account: {account_id}", f"Run: {ts_folder}", ""]
     for region in sorted(excel_index.keys()):
-        lines.append(f"{region}:")
-        for ns, info in sorted(excel_index[region].items()):
-            lines.append(f"  - {ns}: {info['count']} charts → {info['s3_uri']} ({info['size_mb']:.2f} MB)")
-        lines.append("")
+        total_ns = len(excel_index[region])
+        total_charts = sum(info["count"] for info in excel_index[region].values())
+        lines.append(f"{region}: {total_ns} namespaces, {total_charts} charts")
 
-    # Mention the generated ZIP and optional env ZIP
-    lines.insert(2, f"ZIP (this run): {s3_zip_uri}")
-    if ZIP_S3_KEY:
-        lines.insert(3, f"Existing ZIP (env): s3://{S3_BUCKET}/{ZIP_S3_KEY}")
-
-    # Attach the ZIP we just generated (subject to size cap)
-    send_short_email_with_existing_zip(lines, generated_zip_bytes, "dashboards.zip")
+    # ---- Send email with ZIP attachment only (no S3 links)
+    send_email_zip_only(lines, generated_zip_bytes, "dashboards.zip")
 
     return {
         "status": "email_sent",
@@ -357,6 +351,5 @@ def lambda_handler(event, context):
                 "counts": {ns: excel_index[r][ns]["count"] for ns in excel_index[r].keys()}
             } for r in excel_index.keys()
         },
-        "zip_generated": f"s3://{S3_BUCKET}/{zip_key_generated}",
-        "zip_env_also_listed": bool(ZIP_S3_KEY)
+        "zip_generated_s3_key": f"{S3_PREFIX_BASE}/{account_id}/{ts_folder}/dashboards.zip"
     }
