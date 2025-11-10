@@ -1,8 +1,7 @@
 # ===============================================================
 # Lambda: CloudWatch Metrics → Excel (Images-only) → S3 + Email
-# - Single account (current), multi-region
-# - S3 path: {S3_PREFIX_BASE}/{ACCOUNT_ID}/{REGION}/{NAMESPACE}/{TIMESTAMP}/{NAMESPACE}.xlsx
-# - Email: short body, attach ZIP built for this run (no links)
+# - Multi-region, single account
+# - Email: short body, attach ZIP only (no S3 links)
 # ===============================================================
 
 import os, io, re, time, json, boto3, zipfile
@@ -35,17 +34,16 @@ S3_BUCKET            = os.environ["S3_BUCKET"]
 S3_PREFIX_BASE      = os.getenv("S3_PREFIX_BASE", "cloudwatch/excel")
 REGIONS             = [r.strip() for r in os.getenv("REGIONS", "us-east-1,ap-northeast-1,ap-southeast-1").split(",") if r.strip()]
 NAMESPACES          = [x.strip() for x in os.getenv("NAMESPACES", "").split(",") if x.strip()]
-LOOKBACK_ISO        = os.getenv("LOOKBACK_ISO", "-PT24H")  # -PT24H past day, -P7D past week
+LOOKBACK_ISO        = os.getenv("LOOKBACK_ISO", "-PT24H")
 PERIOD_SECONDS      = int(os.getenv("PERIOD_SECONDS", "300"))
 MAX_METRICS_PER_NS  = int(os.getenv("MAX_METRICS_PER_NS", "60"))
 CONCURRENCY         = int(os.getenv("CONCURRENCY", "12"))
 IMG_SCALE           = float(os.getenv("IMG_SCALE", "0.35"))
 WIDGET_WIDTH        = int(os.getenv("WIDGET_WIDTH", "1067"))
 WIDGET_HEIGHT       = int(os.getenv("WIDGET_HEIGHT", "300"))
-MAX_EMAIL_MB        = float(os.getenv("MAX_EMAIL_MB", "7"))
 RENDER_SLEEP_SEC    = float(os.getenv("RENDER_SLEEP_SEC", "0.0"))
 
-# Label formatting
+# Excel label formatting
 METRIC_LABEL_FONT_SIZE = int(os.getenv("METRIC_LABEL_FONT_SIZE", "11"))
 METRIC_LABEL_BOLD      = os.getenv("METRIC_LABEL_BOLD", "true").lower() in ("1", "true", "yes")
 
@@ -134,12 +132,6 @@ def render_widget_image(cw, widget: dict, max_retries: int = 3):
 # Excel (Images-only)
 # ---------------------------
 def build_excel_images_only(namespace: str, region: str, items: list[dict], scanned_count: int) -> bytes:
-    """
-    Single sheet 'Dashboard':
-      - Header (region, lookback, period, timestamp)
-      - KPI tiles (charts rendered, metrics scanned)
-      - Image grid of charts
-    """
     buf = io.BytesIO()
     wb = xlsxwriter.Workbook(buf, {"in_memory": True})
 
@@ -151,7 +143,7 @@ def build_excel_images_only(namespace: str, region: str, items: list[dict], scan
     label_fmt   = wb.add_format({"font_size": METRIC_LABEL_FONT_SIZE, "bold": METRIC_LABEL_BOLD})
 
     ws = wb.add_worksheet("Dashboard")
-    ws.hide_gridlines(2)  # remove background/grid lines
+    ws.hide_gridlines(2)
     ws.set_column(0, 7, 32)
     ws.set_row(0, 28); ws.set_row(1, 18)
 
@@ -205,38 +197,40 @@ def human_period(lookback_iso: str) -> str:
 
 def send_email_zip_only(summary_lines: list[str], zip_bytes: bytes, zip_filename: str = "dashboards.zip"):
     """
-    Sends a short plain-text email and attaches the provided ZIP.
-    Does NOT include any S3 links in the body.
+    Sends short email with ZIP attached (if <= 9.5 MB). No S3 links.
     """
     msg = MIMEMultipart()
     msg["Subject"] = "CloudWatch Metric Dashboards"
     msg["From"] = SES_SENDER_EMAIL
     msg["To"] = ", ".join(SES_RECIPIENT_EMAILS)
 
-    # Short, clean message – no links
     body_lines = [
         "Hi team,",
-        f"This is the CloudWatch metric dashboard for {human_period(LOOKBACK_ISO)}.",
         "",
-        *summary_lines,   # keep this short; no links
+        f"Please find attached the CloudWatch metric dashboards for {human_period(LOOKBACK_ISO)}.",
         "",
-        "Regards,"
+        *summary_lines,
+        "",
+        "Best regards,",
+        "AWS CloudWatch Dashboard Automation",
+        "",
+        "— Automated Report via AWS Lambda"
     ]
     msg.attach(MIMEText("\n".join(body_lines), "plain"))
 
-    # Size guard (prevent SES raw size rejection)
-    if zip_bytes:
+    if not zip_bytes:
+        print("[WARN] No ZIP bytes found — sending without attachment.")
+    else:
         raw_size = len(zip_bytes)
-        b64_size = ((raw_size + 2) // 3) * 4 + 4096
-        limit = int(MAX_EMAIL_MB * 1024 * 1024)
-        print(f"[INFO] ZIP raw={raw_size} bytes, est_b64={b64_size}, cap={limit} (~{MAX_EMAIL_MB} MB)")
-        if b64_size <= limit:
+        limit = 9.5 * 1024 * 1024
+        print(f"[INFO] ZIP size: {raw_size/1024/1024:.2f} MB")
+        if raw_size <= limit:
             part = MIMEApplication(zip_bytes)
             part.add_header("Content-Disposition", "attachment", filename=zip_filename)
             msg.attach(part)
             print(f"[INFO] ZIP attached: {zip_filename}")
         else:
-            print(f"[WARN] ZIP too large to attach (over cap). Email sent without attachment.")
+            print(f"[WARN] ZIP too large (>9.5 MB) — sending without attachment.")
 
     resp = SES.send_raw_email(
         Source=SES_SENDER_EMAIL,
@@ -253,14 +247,11 @@ def lambda_handler(event, context):
     ts_folder = iso_now()
     print(f"[INFO] Start | account={account_id} | regions={REGIONS}")
 
-    # region -> { namespace: { bytes, s3_uri, count, size_mb } }
     excel_index = {}
     total_rendered = 0
 
     for region in REGIONS:
         cw = cw_client(region)
-
-        # Resolve namespaces per region
         target_namespaces = NAMESPACES if NAMESPACES else list_namespaces(cw)
         print(f"[INFO] Region {region}: {len(target_namespaces)} namespaces")
 
@@ -271,8 +262,6 @@ def lambda_handler(event, context):
                 continue
 
             widgets = [build_widget(m) for m in metrics]
-
-            # Render images concurrently
             rendered_items = []
             with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
                 fut_to_idx = {ex.submit(render_widget_image, cw, w): i for i, w in enumerate(widgets)}
@@ -290,66 +279,47 @@ def lambda_handler(event, context):
             rendered_items.sort(key=lambda it: it["title"])
             charts_rendered = sum(1 for it in rendered_items if it["img"])
             if charts_rendered == 0:
-                print(f"[INFO] {region} | {ns}: no images rendered, skipping Excel")
+                print(f"[INFO] {region} | {ns}: no charts rendered — skipping Excel.")
                 continue
 
             total_rendered += charts_rendered
+            excel_bytes = build_excel_images_only(ns, region, rendered_items, len(metrics))
 
-            # Build Excel (images only)
-            excel_bytes = build_excel_images_only(ns, region, rendered_items, scanned_count=len(metrics))
-
-            # S3 key: {base}/{account}/{region}/{namespace}/{ts}/{namespace}.xlsx
             key = f"{S3_PREFIX_BASE}/{account_id}/{region}/{safe(ns)}/{ts_folder}/{safe(ns)}.xlsx"
-            s3_uri = s3_put(key, excel_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            s3_put(key, excel_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
             excel_index.setdefault(region, {})
-            excel_index[region][ns] = {
-                "bytes": excel_bytes,
-                "s3_uri": s3_uri,  # kept for logs/traceability (not emailed)
-                "count": charts_rendered,
-                "size_mb": len(excel_bytes) / (1024 * 1024),
-            }
+            excel_index[region][ns] = {"bytes": excel_bytes, "count": charts_rendered}
 
     if not excel_index:
-        return {"status": "no_excel_files_generated", "account": account_id, "regions": REGIONS}
+        return {"status": "no_excels", "account": account_id}
 
-    # ---- Build a single ZIP for this account with all region/namespace Excels
+    # --- Build ZIP for all regions/namespaces
     zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
         for region, ns_map in excel_index.items():
             for ns, info in ns_map.items():
-                # Path inside zip: region/namespace.xlsx
                 z.writestr(f"{region}/{safe(ns)}.xlsx", info["bytes"])
     zip_buf.seek(0)
-    generated_zip_bytes = zip_buf.read()
+    zip_bytes = zip_buf.read()
 
-    # Put ZIP under the account folder for this run (durability only; not referenced in email)
-    zip_key_generated = f"{S3_PREFIX_BASE}/{account_id}/{ts_folder}/dashboards.zip"
-    s3_put(zip_key_generated, generated_zip_bytes, "application/zip")
+    # Upload ZIP for durability (not linked in email)
+    zip_key = f"{S3_PREFIX_BASE}/{account_id}/{ts_folder}/dashboards.zip"
+    s3_put(zip_key, zip_bytes, "application/zip")
 
-    # ---- Build short summary lines (no links)
-    # Keep concise: account, run timestamp, per-region counts
-    lines = [f"Account: {account_id}", f"Run: {ts_folder}", ""]
+    # --- Email summary
+    lines = [f"Account: {account_id}", f"Run timestamp: {ts_folder}", ""]
     for region in sorted(excel_index.keys()):
-        total_ns = len(excel_index[region])
-        total_charts = sum(info["count"] for info in excel_index[region].values())
-        lines.append(f"{region}: {total_ns} namespaces, {total_charts} charts")
+        ns_count = len(excel_index[region])
+        chart_count = sum(info["count"] for info in excel_index[region].values())
+        lines.append(f"{region}: {ns_count} namespaces, {chart_count} charts")
 
-    # ---- Send email with ZIP attachment only (no S3 links)
-    send_email_zip_only(lines, generated_zip_bytes, "dashboards.zip")
+    send_email_zip_only(lines, zip_bytes, "cloudwatch_dashboards.zip")
 
     return {
         "status": "email_sent",
         "account": account_id,
-        "regions": sorted(excel_index.keys()),
-        "s3_prefix_base": S3_PREFIX_BASE,
-        "timestamp": ts_folder,
+        "regions": list(excel_index.keys()),
         "total_metrics_rendered": total_rendered,
-        "per_region": {
-            r: {
-                "namespaces": sorted(excel_index[r].keys()),
-                "counts": {ns: excel_index[r][ns]["count"] for ns in excel_index[r].keys()}
-            } for r in excel_index.keys()
-        },
-        "zip_generated_s3_key": f"{S3_PREFIX_BASE}/{account_id}/{ts_folder}/dashboards.zip"
+        "zip_s3_key": zip_key
     }
